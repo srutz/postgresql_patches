@@ -1,0 +1,48 @@
+diff --git a/./src/backend/nodes/nodeFuncs.c b/./src/backend/nodes/nodeFuncs.c
+index 6ad995f..53dff5b 100644
+--- a/./src/backend/nodes/nodeFuncs.c
++++ b/./src/backend/nodes/nodeFuncs.c
+@@ -2414,7 +2414,42 @@ expression_tree_mutator(Node *node,
+ 				TargetEntry *newnode;
+ 
+ 				FLATCOPY(newnode, targetentry, TargetEntry);
+-				MUTATE(newnode->expr, targetentry->expr, Expr *);
++				PG_TRY();
++                                {
++					MUTATE(newnode->expr, targetentry->expr, Expr *);
++				}
++                                PG_CATCH();
++                                {
++					/* provide more error information here, if one has a long
++					   insert statement with a values-clause that contains many columns
++					   then in case the mutation fails we want to know what the target field
++					   is that caused the problem. this is the case when we have a too long
++					   string that we try to put into a varchar column whose size is exceeded.
++					   without this block we just get an error saying "value too long" but we
++					   are left without any column information and in our application code we
++					   would be force to analyze the values of statement beforehand to get any
++					   indication whatsoever */
++					
++					ErrorData *edata = CopyErrorData();
++					if (edata != NULL && edata->message != NULL) 
++					{
++						char extra_message[2048];
++						Size mlen;
++						char *nstr;
++
++						snprintf(extra_message, 2048, " (column-resname is \"%s\")", targetentry->resname);
++						mlen = strlen(edata->message);
++						nstr = MemoryContextAlloc(CurrentMemoryContext, mlen + strlen(extra_message) + 1);
++						memcpy(nstr, edata->message, mlen + 1);
++						strcat(nstr, extra_message);
++						errmsg("%s", nstr);
++						/*fprintf(stderr, "we got the bug at %s: %s\r\n", targetentry->resname, nstr);*/
++					}
++					if (edata != NULL) 
++						FreeErrorData(edata);
++					PG_RE_THROW();
++				}
++				PG_END_TRY();
+ 				return (Node *) newnode;
+ 			}
+ 			break;

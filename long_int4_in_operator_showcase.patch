@@ -1,0 +1,125 @@
+diff --git a/src/backend/executor/execQual.c b/src/backend/executor/execQual.c
+index 7cfa63f..0076e3d 100644
+--- a/src/backend/executor/execQual.c
++++ b/src/backend/executor/execQual.c
+@@ -182,6 +182,12 @@ static Datum ExecEvalArrayCoerceExpr(ArrayCoerceExprState *astate,
+ static Datum ExecEvalCurrentOfExpr(ExprState *exprstate, ExprContext *econtext,
+ 					  bool *isNull, ExprDoneCond *isDone);
+ 
++/*
++ * Forward-declarions for a qsort/bsearch comparators for optimized
++ * searching in long immediately given IN()-lists
++ */
++static int DatumInt4Compare(const void *aptr, const void *bptr);
++
+ 
+ /* ----------------------------------------------------------------
+  *		ExecEvalExpr routines
+@@ -2601,6 +2607,36 @@ ExecEvalScalarArrayOp(ScalarArrayOpExprState *sstate,
+ 	bitmap = ARR_NULLBITMAP(arr);
+ 	bitmask = 1;
+ 
++	/* Lets Optimize just some cases case, seen means we have given up for all
++	 * iterations in this sstate */
++	if (sstate->transformRecord != ATRECORD_SEEN)
++	{
++		/* This criteria is quite hardcoded and fit to only the int4 case */
++		if (nitems > 10 && arr->ndim == 1 && useOr && arr->elemtype == INT4OID && fcinfo->flinfo->fn_oid == 65)
++		{
++			//fprintf(stderr, "runing optimiued...\r\n");
++			size_t elemsize = sizeof(int32);
++			/* Sort just once and then mark state as sorted */
++			if (sstate->transformRecord == ATRECORD_UNSEEN)
++			{
++				qsort(s, nitems, elemsize, DatumInt4Compare);
++				sstate->transformRecord = ATRECORD_SORTED_ASC;
++			}
++			/* Is this safe? The right hand side is elemtype23 already */
++			int32 key = DatumGetInt32(fcinfo->arg[0]);
++			void* searchptr = bsearch(&key, s, nitems, elemsize, DatumInt4Compare);
++			result = BoolGetDatum(searchptr != NULL);
++			resultnull = *isNull = false;
++
++			/* Done using the besearch approach, exit early */
++			return result;
++		}
++
++		/* If we get here we will not consider this sstate for further transforms */
++		sstate->transformRecord = ATRECORD_SEEN;
++	}
++
++	/* Regular code path, process in() expression as usual with the generic code */
+ 	for (i = 0; i < nitems; i++)
+ 	{
+ 		Datum		elt;
+@@ -2671,6 +2707,24 @@ ExecEvalScalarArrayOp(ScalarArrayOpExprState *sstate,
+ 	return result;
+ }
+ 
++
++/* Method needed for optimized long IN() expressions, which uses binary
++ * search and needs to compare datums. Name of the method is misleading,
++ * it will only work for elemtype 23 (plain integers in a continous
++ * memory array.
++ */
++static int DatumInt4Compare(const void *aptr, const void *bptr)
++{
++	const int32 *ia = (const int *)aptr;
++	const int32 *ib = (const int *)bptr;
++	int32 a = *ia;
++	int32 b = *ib;
++	return a < b ? -1 : (a > b ? 1 : 0);
++}
++
++
++
++
+ /* ----------------------------------------------------------------
+  *		ExecEvalNot
+  *		ExecEvalOr
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index b271f21..7725ea2 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -695,6 +695,20 @@ typedef struct FuncExprState
+ } FuncExprState;
+ 
+ /* ----------------
++ * need to record transforms that occur within the context
++ * of a ScalarArrayOpExprState
++ * ----------------
++ */
++typedef enum ArrayTransformRecord
++{
++	ATRECORD_UNSEEN,      /* default, makeNode ensures this will be default */
++	ATRECORD_SEEN,        /* we have already seen this one, but will continue
++						   * without any optimization attempts */
++	ATRECORD_SORTED_ASC   /* for binary search */
++} ArrayTransformRecord;
++
++
++/* ----------------
+  *		ScalarArrayOpExprState node
+  *
+  * This is a FuncExprState plus some additional data.
+@@ -708,6 +722,20 @@ typedef struct ScalarArrayOpExprState
+ 	int16		typlen;
+ 	bool		typbyval;
+ 	char		typalign;
++
++	/* If the node was optimized in way that is amortized over several
++	 * usages of the expression (eg a local cache is build or an array
++	 * of values is sorted so that it is then eligle for binarysearch,
++	 * the state of that what actually happened will be recorded here,
++	 * so that we can actually make this transforms or cache constructions
++	 * once ber array. Then during the course of execution we could use
++	 * a hashlookup or binary-search to check for the "useOr" case, eg
++	 * support performance enhancement for excessively long IN()
++	 * sql-expressions. Probably it is a bad thing to support such bad
++	 * sql usage-patterns, but in practise they can be a necessary evil
++	 * in application code sometimes.
++	 */
++	ArrayTransformRecord transformRecord;
+ } ScalarArrayOpExprState;
+ 
+ /* ----------------
